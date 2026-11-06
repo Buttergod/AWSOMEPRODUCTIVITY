@@ -1,73 +1,212 @@
-![Banner image](https://raw.githubusercontent.com/n8n-io/n8n/master/assets/readme-banner.jpg)
+# Software Composition Analysis (SCA)
 
-# n8n – The Platform for AI Agents and Workflow Automation
+## Posture
 
-Fair-code platform to build and deploy AI agents and workflows. Combine a visual canvas with custom code, run it self-hosted or in the [cloud](https://app.n8n.cloud/login), and connect to 1500+ integrations. AI automation you can trust with real work, from prototype to production.
+Every component in the enriched release SBOM carries a valid SPDX license
+identifier. The two dual-licensed packages in the tree (`jszip`, `mailsplit`)
+offer MIT as an alternative to their copyleft option; n8n elects MIT for both,
+recorded as `cdx:license:elected` in the SBOM. No copyleft license is in force.
 
-![n8n.io - Screenshot](https://raw.githubusercontent.com/n8n-io/n8n/master/assets/n8n-screenshot-readme.png)
+---
 
-## Key Capabilities
+## License picture
 
-- **AI-Native Automation Platform**: Build and operationalize AI workflows and multi-step agents using your own data, models, and tools
-- **Model Flexibility, No Lock-In**: Connect to OpenAI, Anthropic, Google, or open-source models and switch providers without changing your architecture
-- **From Prototype to Production**: Design multi-step AI workflows with logic, tool use, human approvals, and full observability
-- **Code When You Need It**: Combine visual building with JavaScript, Python, and npm packages for advanced AI workflows
-- **Enterprise-Ready AI**: Self-host or deploy securely with role-based access, audit trails, and support for sensitive data
-- **Leverage What Already Exists**: 1500+ integrations and 9,000+ workflow [templates](https://n8n.io/workflows) to connect AI with your existing systems
+| Scope | License | Notes |
+|---|---|---|
+| `@n8n/*`, `n8n`, `n8n-core`, `n8n-nodes-base`, `n8n-workflow`, `n8n-editor-ui` | `LicenseRef-n8n-sustainable-use` | Full text at https://docs.n8n.io/sustainable-use-license/ |
+| Community tooling, codemirror extensions | `MIT` / `Apache-2.0` / `ISC` | Intentionally OSI-licensed |
+| `@n8n_io/license-sdk`, `@n8n_io/ai-assistant-sdk` | `LicenseRef-n8n-enterprise` | EE-only runtime components; require enterprise contract |
+| All third-party npm dependencies | Permissive OSI | No copyleft; dual-licensed packages elect MIT |
 
-## Quick Start
+A human-readable rendering is at `/rest/third-party-licenses` on any running
+n8n instance and as `THIRD_PARTY_LICENSES.md` attached to each GitHub release.
 
-Try n8n instantly with our install script (requires [Docker](https://www.docker.com/)):
+---
 
-```sh
-curl -fsSL https://get.n8n.io | sh
+## SBOM pipelines
+
+### Release SBOM (authoritative)
+
+Produced by `sbom-generation-callable.yml` on every release. This is the
+artifact to use for compliance review.
+
+```
+pnpm build:deploy (N8N_GENERATE_LICENSES=true)
+  └─ cdxgen          →  sbom-source.cdx.json
+  └─ enrich-sbom.mjs →  resolves first-party + override licenses
+  └─ check-sbom-licenses.mjs  →  SPDX gate (release-blocking)
+  └─ actions/attest  →  signed attestation against package.json
+  └─ gh release upload
 ```
 
-Or deploy manually with [Docker](https://docs.n8n.io/hosting/installation/docker/):
+The nightly validation builds the same production deployment closure and runs the same
+enrichment and SPDX gate through `sbom-validation-callable.yml`. It has read-only
+permissions and does not contain attestation or release upload steps.
+
+### Docker image SBOM
+
+Produced by the `sbom-attestation` job in `docker-build-push.yml` for release builds that
+enable attestations.
 
 ```
-docker volume create n8n_data
-docker run -it --rm --name n8n -p 5678:5678 -v n8n_data:/home/node/.n8n docker.n8n.io/n8nio/n8n
+docker push
+  └─ syft              →  OS + npm scan of the pushed image
+  └─ enrich-sbom.mjs   →  resolves licenses, drops scan phantoms
+  └─ check-sbom-licenses.mjs  →  SPDX gate (npm only)
+  └─ cosign attest     →  attested to image digest
 ```
 
-Access the editor at http://localhost:5678
+The daily validation waits up to two hours for the current scheduled Docker build to
+complete. It resolves that build's immutable SHA tags to digests. It runs the same Syft
+scan, enrichment, and npm SPDX gate for all four images. It uses
+`attest-image-sbom.mjs --validate-only`, so it does not run Cosign or write to the registry.
 
-## Resources
+The two pipelines use different scanners deliberately. The release SBOM scans a
+pnpm lockfile, which has no package files to read licenses from, so it queries
+the npm registry (`FETCH_LICENSE=true`). The image SBOM scans a filesystem, so
+syft reads licenses from the LICENSE files already present — no network, and it
+reports the OS layer by installed subpackage rather than by source package.
 
-- 📚 [Documentation](https://docs.n8n.io)
-- 🔧 [1500+ Integrations](https://n8n.io/integrations)
-- 💡 [Example Workflows](https://n8n.io/workflows)
-- 🤖 [AI & LangChain Guide](https://docs.n8n.io/advanced-ai/)
-- 👥 [Community Forum](https://community.n8n.io)
-- 📖 [Community Tutorials](https://community.n8n.io/c/tutorials/28)
+---
 
-## Support
+## Verifying the SBOM
 
-Need help? Our community forum is the place to get support and connect with other users:
-[community.n8n.io](https://community.n8n.io)
+The enriched, attested SBOM is attached to every published Docker image via
+cosign. Pull it once and run all checks against the file.
 
-## License
+```bash
+# Resolve the tag to an immutable digest first, and use $IMAGE everywhere below.
+# A moving tag such as `latest` or `nightly` can point at a different image
+# between two commands, so you would verify one image and scan another.
+DIGEST=$(docker buildx imagetools inspect ghcr.io/n8n-io/n8n:<version> \
+  --format '{{println .Manifest.Digest}}')
+IMAGE="ghcr.io/n8n-io/n8n@${DIGEST}"
 
-n8n is [fair-code](https://faircode.io) distributed under the [Sustainable Use License](https://github.com/n8n-io/n8n/blob/master/LICENSE.md) and [n8n Enterprise License](https://github.com/n8n-io/n8n/blob/master/LICENSE_EE.md).
+# Pull the attested SBOM
+cosign download attestation "$IMAGE" \
+  --predicate-type https://cyclonedx.org/bom \
+  | jq -r '.payload' | base64 -d | jq '.predicate' > sbom.cdx.json
 
-- **Source Available**: Always visible source code
-- **Self-Hostable**: Deploy anywhere
-- **Extensible**: Add your own nodes and functionality
+# Verify it was produced by n8n's CI (not tampered with)
+cosign verify-attestation "$IMAGE" \
+  --type cyclonedx \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp "https://github.com/n8n-io/n8n/.github/workflows/"
 
-[Enterprise Licenses](mailto:license@n8n.io) available for additional features and support.
+# n8n's SPDX gate — expect 0 failures.
+# This is the authoritative check: every npm component carries a valid SPDX
+# identifier or an allowed n8n LicenseRef. It is release-blocking in CI.
+node scripts/licenses/check-sbom-licenses.mjs sbom.cdx.json \
+  --allow-ref=LicenseRef-n8n-sustainable-use \
+  --allow-ref=LicenseRef-n8n-enterprise \
+  --enforce-prefix=pkg:npm/
 
-Additional information about the license model can be found in the [docs](https://docs.n8n.io/sustainable-use-license/).
+# Full license list
+grant list sbom.cdx.json
 
-## Contributing
+# Unlicensed check. Expect a small number of entries, all vendored Windows
+# .exe binaries sitting inside a parent npm package (ssh2/util/pagent.exe,
+# selenium-manager.exe). syft catalogues them as standalone applications with
+# no purl; their license is the parent package's, which is itself in the SBOM
+# and gated above. Not a compliance gap — see "Unlicensed entries" below.
+grant check --unlicensed sbom.cdx.json
 
-Found a bug 🐛 or have a feature idea ✨? Check our [Contributing Guide](https://github.com/n8n-io/n8n/blob/master/CONTRIBUTING.md) for a setup guide & best practices.
+# Vulnerability scan
+grype sbom:sbom.cdx.json
 
-## Join the Team
+# Full audit — vulnerabilities + licenses.
+# Expect two targets in the report: the Alpine OS layer and the Node.js layer.
+# If you only see "Node.js", read "OS vulnerability coverage" below.
+trivy sbom sbom.cdx.json
+```
 
-Want to shape the future of automation? Check out our [job posts](https://n8n.io/careers) and join our team!
+### OS vulnerability coverage
 
-## What does n8n mean?
+Scanners select a distro vulnerability feed from the SBOM's `operating-system`
+component. Without it they list the apk packages but never match them, so the
+report covers the Node.js layer only and **silently skips Alpine CVEs**.
 
-**Short answer:** It means "nodemation" and is pronounced as n-eight-n.
+Check before relying on an SBOM scan:
 
-**Long answer:** "I get that question quite often (more often than I expected) so I decided it is probably best to answer it here. While looking for a good name for the project with a free domain I realized very quickly that all the good ones I could think of were already taken. So, in the end, I chose nodemation. 'node-' in the sense that it uses a Node-View and that it uses Node.js and '-mation' for 'automation' which is what the project is supposed to help with. However, I did not like how long the name was and I could not imagine writing something that long every time in the CLI. That is when I then ended up on 'n8n'." - **Jan Oberhauser, Founder and CEO, n8n.io**
+```bash
+jq -r '.components[] | select(.type=="operating-system") | "\(.name) \(.version)"' sbom.cdx.json
+```
+
+Expect `alpine <version>`. Older image SBOMs were generated by a scanner that
+omitted this component. If the command returns nothing, scan the image directly,
+which always covers both layers:
+
+```bash
+trivy image "$IMAGE"
+```
+
+Use the same `$IMAGE` digest resolved above, so the scan covers the image the
+SBOM describes.
+
+Replace `<version>` with `nightly`, `latest`, or a specific version tag
+(e.g. `2.37.4`). The same image is available on both `ghcr.io/n8n-io/n8n` and
+`docker.io/n8nio/n8n`.
+
+---
+
+## Unlicensed entries
+
+`grant check --unlicensed` reports a handful of entries on the image SBOM. They
+are Windows `.exe` files vendored inside npm packages — `ssh2/util/pagent.exe`,
+`selenium-webdriver/bin/windows/selenium-manager.exe`,
+`agent-browser/bin/agent-browser-win32-x64.exe`. syft catalogues each shipped
+binary as its own component; these carry no purl and no independent license
+because they belong to a parent npm package, which is in the SBOM and does carry
+a gated license.
+
+They are inert on a Linux image. The authoritative statement is the SPDX gate:
+**every npm component carries a valid SPDX license or an allowed n8n
+LicenseRef**, enforced on every release.
+
+---
+
+## Copyleft explainer
+
+The Docker image SBOM will show GPL/LGPL entries in `grant list`. These come
+entirely from Alpine OS system packages (`busybox` GPL-2.0-only, `git`
+GPL-2.0-only, `libgcc` and `libstdc++` GPL-2.0-or-later AND LGPL-2.1-or-later,
+and similar). GPL in an OS binary has no effect on n8n's licensing
+obligations or your use of n8n; they are inventoried in the SBOM for
+completeness but are not gated by the license pipeline.
+
+The npm layer contains no copyleft in force. The two dual-licensed packages
+(`jszip`: MIT OR GPL-3.0-or-later, `mailsplit`: MIT OR EUPL-1.1+) elect MIT;
+this election is recorded as `cdx:license:elected` in the SBOM.
+
+---
+
+## Release SBOM
+
+For source-level compliance review, download from the GitHub release page:
+
+```bash
+gh release download n8n@<version> \
+  --repo n8n-io/n8n \
+  --pattern sbom-source.cdx.json
+
+gh attestation verify sbom-source.cdx.json \
+  --repo n8n-io/n8n \
+  --owner n8n-io
+```
+
+---
+
+## Tooling
+
+| Tool | Role |
+|---|---|
+| syft | Image SBOM generation (CycloneDX 1.6) — resolves licenses from files on disk |
+| cdxgen | Release SBOM generation (CycloneDX 1.6) from the pnpm lockfile |
+| enrich-sbom.mjs | License enrichment (`scripts/licenses/`) |
+| check-sbom-licenses.mjs | SPDX compliance gate (`scripts/licenses/`) |
+| grant | License listing and unlicensed check |
+| grype | Vulnerability scanning against SBOM |
+| trivy | Full audit — vulnerabilities + licenses |
+| cosign / actions/attest | SBOM attestation |
+
+See `security/vex.openvex.json` for the VEX document attested alongside the image.
